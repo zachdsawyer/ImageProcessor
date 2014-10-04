@@ -12,7 +12,6 @@ namespace ImageProcessor.Web.HttpModules
 {
     #region Using
     using System;
-    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Diagnostics.CodeAnalysis;
     using System.IO;
@@ -23,7 +22,6 @@ namespace ImageProcessor.Web.HttpModules
     using System.Security.Permissions;
     using System.Security.Principal;
     using System.Text.RegularExpressions;
-    using System.Threading;
     using System.Threading.Tasks;
     using System.Web;
     using System.Web.Hosting;
@@ -46,19 +44,29 @@ namespace ImageProcessor.Web.HttpModules
         private const string CachedResponseTypeKey = "CACHED_IMAGE_RESPONSE_TYPE_054F217C-11CF-49FF-8D2F-698E8E6EB58F";
 
         /// <summary>
+        /// The key for storing the cached path of the current image.
+        /// </summary>
+        private const string CachedPathKey = "CACHED_IMAGE_PATH_TYPE_E0741478-C17B-433D-96A8-6CDA797644E9";
+
+        /// <summary>
+        /// The key for storing the file dependency of the current image.
+        /// </summary>
+        private const string CachedResponseFileDependency = "CACHED_IMAGE_DEPENDENCY_054F217C-11CF-49FF-8D2F-698E8E6EB58F";
+
+        /// <summary>
         /// The regular expression to search strings for.
         /// </summary>
         private static readonly Regex PresetRegex = new Regex(@"preset=[^&]*", RegexOptions.Compiled);
 
         /// <summary>
+        /// The locker for preventing duplicate requests.
+        /// </summary>
+        private static readonly AsyncDuplicateLock Locker = new AsyncDuplicateLock();
+
+        /// <summary>
         /// The assembly version.
         /// </summary>
         private static readonly string AssemblyVersion = Assembly.GetExecutingAssembly().GetName().Version.ToString();
-
-        /// <summary>
-        /// The collection of SemaphoreSlims for identifying given locking individual queries.
-        /// </summary>
-        private static readonly ConcurrentDictionary<string, SemaphoreSlim> SemaphoreSlims = new ConcurrentDictionary<string, SemaphoreSlim>();
 
         /// <summary>
         /// The value to prefix any remote image requests with to ensure they get captured.
@@ -128,9 +136,15 @@ namespace ImageProcessor.Web.HttpModules
 #if NET45
             EventHandlerTaskAsyncHelper wrapper = new EventHandlerTaskAsyncHelper(this.PostAuthorizeRequest);
             context.AddOnPostAuthorizeRequestAsync(wrapper.BeginEventHandler, wrapper.EndEventHandler);
+
+            EventHandlerTaskAsyncHelper postProcessHelper = new EventHandlerTaskAsyncHelper(this.PostRequestHandlerExecute);
+            context.AddOnPostRequestHandlerExecuteAsync(postProcessHelper.BeginEventHandler, postProcessHelper.EndEventHandler);
+
 #else
             context.PostAuthorizeRequest += this.PostAuthorizeRequest;
+            context.PostRequestHandlerExecute += this.PostRequestHandlerExecute;
 #endif
+
             context.PreSendRequestHeaders += this.ContextPreSendRequestHeaders;
         }
 
@@ -150,22 +164,6 @@ namespace ImageProcessor.Web.HttpModules
         }
 
         /// <summary>
-        /// Gets the specific <see cref="T:System.Threading.SemaphoreSlim"/> for the given id.
-        /// </summary>
-        /// <param name="id">
-        /// The id representing the <see cref="T:System.Threading.SemaphoreSlim"/>.
-        /// </param>
-        /// <returns>
-        /// The <see cref="T:System.Threading.Mutex"/> for the given id.
-        /// </returns>
-        private static SemaphoreSlim GetSemaphoreSlim(string id)
-        {
-            id = id.ToMD5Fingerprint();
-            SemaphoreSlim semaphore = SemaphoreSlims.GetOrAdd(id, new SemaphoreSlim(1, 1));
-            return semaphore;
-        }
-
-        /// <summary>
         /// Disposes the object and frees resources for the Garbage Collector.
         /// </summary>
         /// <param name="disposing">If true, the object gets disposed.</param>
@@ -179,12 +177,6 @@ namespace ImageProcessor.Web.HttpModules
             if (disposing)
             {
                 // Dispose of any managed resources here.
-                //foreach (KeyValuePair<string, SemaphoreSlim> semaphore in SemaphoreSlims)
-                //{
-                //    semaphore.Value.Dispose();
-                //}
-
-                //SemaphoreSlims.Clear();
             }
 
             // Call the appropriate methods to clean up
@@ -214,6 +206,17 @@ namespace ImageProcessor.Web.HttpModules
             return this.ProcessImageAsync(context);
         }
 
+        /// <summary>
+        /// Occurs when the ASP.NET event handler (for example, a page or an XML Web service) finishes execution.
+        /// </summary>
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">An <see cref="T:System.EventArgs">EventArgs</see> that contains the event data.</param>
+        private Task PostRequestHandlerExecute(object sender, EventArgs e)
+        {
+            HttpContext context = ((HttpApplication)sender).Context;
+            return this.PostProcessImage(context);
+        }
+
 #else
 
         /// <summary>
@@ -225,6 +228,17 @@ namespace ImageProcessor.Web.HttpModules
         {
             HttpContext context = ((HttpApplication)sender).Context;
             await this.ProcessImageAsync(context);
+        }
+
+        /// <summary>
+        /// Occurs when the ASP.NET event handler (for example, a page or an XML Web service) finishes execution.
+        /// </summary>
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">An <see cref="T:System.EventArgs">EventArgs</see> that contains the event data.</param>
+        private async void PostRequestHandlerExecute(object sender, EventArgs e)
+        {
+            HttpContext context = ((HttpApplication)sender).Context;
+            await this.PostProcessImage(context);
         }
 
 #endif
@@ -239,19 +253,53 @@ namespace ImageProcessor.Web.HttpModules
             HttpContext context = ((HttpApplication)sender).Context;
 
             object responseTypeObject = context.Items[CachedResponseTypeKey];
+            object dependencyFileObject = context.Items[CachedResponseFileDependency];
 
-            if (responseTypeObject != null)
+            if (responseTypeObject != null && dependencyFileObject != null)
             {
                 string responseType = (string)responseTypeObject;
+                List<string> dependencyFiles = (List<string>)dependencyFileObject;
 
                 // Set the headers
-                this.SetHeaders(context, responseType);
+                this.SetHeaders(context, responseType, dependencyFiles);
 
                 context.Items[CachedResponseTypeKey] = null;
+                context.Items[CachedResponseFileDependency] = null;
             }
         }
 
         #region Private
+        /// <summary>
+        /// Occurs when the ASP.NET event handler finishes execution.
+        /// </summary>
+        /// <param name="sender">
+        /// The source of the event.
+        /// </param>
+        /// <returns>
+        /// The <see cref="T:System.Threading.Tasks.Task"/>.
+        /// </returns>
+        private Task PostProcessImage(object sender)
+        {
+            HttpContext context = (HttpContext)sender;
+            object cachedPathObject = context.Items[CachedPathKey];
+
+            if (cachedPathObject != null)
+            {
+                string cachedPath = cachedPathObject.ToString();
+
+                // Trim the cache.
+                DiskCache.TrimCachedFolders(cachedPath);
+            }
+
+#if NET45
+            return Task.FromResult<object>(null);
+#else
+            TaskCompletionSource<object> taskCompletionSource = new TaskCompletionSource<object>();
+            taskCompletionSource.SetResult(null);
+            return taskCompletionSource.Task;
+#endif
+        }
+
         /// <summary>
         /// Processes the image.
         /// </summary>
@@ -326,7 +374,6 @@ namespace ImageProcessor.Web.HttpModules
                 queryString = this.ReplacePresetsInQueryString(queryString);
 
                 string fullPath = string.Format("{0}?{1}", requestPath, queryString);
-                string imageName = Path.GetFileName(requestPath);
 
                 if (validExtensionLessUrl && !string.IsNullOrWhiteSpace(extensionLessExtension))
                 {
@@ -337,16 +384,15 @@ namespace ImageProcessor.Web.HttpModules
                         string hashedUrlParameters = urlParameters.ToMD5Fingerprint();
 
                         // TODO: Add hash for querystring parameters.    
-                        imageName += hashedUrlParameters;
                         fullPath += hashedUrlParameters;
                     }
 
-                    imageName += "." + extensionLessExtension;
                     fullPath += extensionLessExtension + "?" + queryString;
                 }
 
                 // Create a new cache to help process and cache the request.
-                DiskCache cache = new DiskCache(requestPath, fullPath, imageName, isRemote);
+                DiskCache cache = new DiskCache(requestPath, fullPath);
+                string cachedPath = cache.CachedPath;
 
                 // Since we are now rewriting the path we need to check again that the current user has access
                 // to the rewritten path.
@@ -372,13 +418,11 @@ namespace ImageProcessor.Web.HttpModules
                 if (isAllowed)
                 {
                     // Is the file new or updated?
-                    bool isNewOrUpdated = await cache.IsNewOrUpdatedFileAsync();
+                    bool isNewOrUpdated = cache.IsNewOrUpdatedFile(cachedPath);
 
                     // Only process if the file has been updated.
                     if (isNewOrUpdated)
                     {
-                        string cachedPath = cache.CachedPath;
-
                         // Process the image.
                         using (ImageFactory imageFactory = new ImageFactory(preserveExifMetaData != null && preserveExifMetaData.Value))
                         {
@@ -390,12 +434,12 @@ namespace ImageProcessor.Web.HttpModules
 
                                 // Prevent response blocking.
                                 WebResponse webResponse = await remoteFile.GetWebResponseAsync().ConfigureAwait(false);
-
-                                SemaphoreSlim semaphore = GetSemaphoreSlim(cachedPath);
-                                try
+#if NET45
+                                using (await Locker.LockAsync(cachedPath))
+#else
+                                using (Locker.Lock(cachedPath))
+#endif
                                 {
-                                    semaphore.Wait();
-
                                     using (MemoryStream memoryStream = new MemoryStream())
                                     {
                                         using (WebResponse response = webResponse)
@@ -408,26 +452,21 @@ namespace ImageProcessor.Web.HttpModules
 
                                                     // Process the Image
                                                     imageFactory.Load(memoryStream)
-                                                                .AddQueryString(queryString)
-                                                                .AutoProcess()
-                                                                .Save(cachedPath);
-
-                                                    // Store the response type in the context for later retrieval.
-                                                    context.Items[CachedResponseTypeKey] = imageFactory.MimeType;
+                                                        .AddQueryString(queryString)
+                                                        .AutoProcess()
+                                                        .Save(cachedPath);
 
                                                     // Add to the cache.
-                                                    cache.AddImageToCache();
+                                                    cache.AddImageToCache(cachedPath);
 
-                                                    // Trim the cache.
-                                                    await cache.TrimCachedFolderAsync(cachedPath);
+                                                    // Store the cached path, response type, and cache dependency in the context for later retrieval.
+                                                    context.Items[CachedPathKey] = cachedPath;
+                                                    context.Items[CachedResponseTypeKey] = imageFactory.MimeType;
+                                                    context.Items[CachedResponseFileDependency] = new List<string> { cachedPath };
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                finally
-                                {
-                                    semaphore.Release();
                                 }
                             }
                             else
@@ -441,47 +480,61 @@ namespace ImageProcessor.Web.HttpModules
                                     throw new HttpException(404, "No image exists at " + fullPath);
                                 }
 
-                                SemaphoreSlim semaphore = GetSemaphoreSlim(cachedPath);
-                                try
+#if NET45
+                                using (await Locker.LockAsync(cachedPath))
+#else
+                                using (Locker.Lock(cachedPath))
+#endif
                                 {
-                                    semaphore.Wait();
-
                                     // Process the Image
                                     imageFactory.Load(fullPath).AutoProcess().Save(cachedPath);
 
-                                    // Store the response type in the context for later retrieval.
-                                    context.Items[CachedResponseTypeKey] = imageFactory.MimeType;
-
                                     // Add to the cache.
-                                    cache.AddImageToCache();
+                                    cache.AddImageToCache(cachedPath);
 
-                                    // Trim the cache.
-                                    await cache.TrimCachedFolderAsync(cachedPath);
-                                }
-                                finally
-                                {
-                                    semaphore.Release();
+                                    // Store the cached path, response type, and cache dependency in the context for later retrieval.
+                                    context.Items[CachedPathKey] = cachedPath;
+                                    context.Items[CachedResponseTypeKey] = imageFactory.MimeType;
+                                    context.Items[CachedResponseFileDependency] = new List<string> { cachedPath };
                                 }
                             }
                         }
+                    }
+
+                    // Image is from the cache so the mime-type will need to be set.
+                    if (context.Items[CachedResponseTypeKey] == null)
+                    {
+                        string mimetype = ImageHelpers.GetMimeType(cachedPath);
+
+                        if (!string.IsNullOrEmpty(mimetype))
+                        {
+                            context.Items[CachedResponseTypeKey] = mimetype;
+                        }
+                    }
+
+                    if (context.Items[CachedResponseFileDependency] == null)
+                    {
+                        context.Items[CachedResponseFileDependency] = new List<string> { cachedPath };
                     }
 
                     string incomingEtag = context.Request.Headers["If-None-Match"];
 
                     if (incomingEtag != null && !isNewOrUpdated)
                     {
-                        // Explicitly set the Content-Length header so the client doesn't wait for
-                        // content but keeps the connection open for other requests
+                        // Set the Content-Length header so the client doesn't wait for
+                        // content but keeps the connection open for other requests.
                         context.Response.AddHeader("Content-Length", "0");
                         context.Response.StatusCode = (int)HttpStatusCode.NotModified;
                         context.Response.SuppressContent = true;
-                        context.Response.AddFileDependency(context.Server.MapPath(virtualCachedPath));
-                        this.SetHeaders(context, (string)context.Items[CachedResponseTypeKey]);
 
                         if (!isRemote)
                         {
+                            // Set the headers and quit.
+                            this.SetHeaders(context, (string)context.Items[CachedResponseTypeKey], new List<string> { requestPath, cachedPath });
                             return;
                         }
+
+                        this.SetHeaders(context, (string)context.Items[CachedResponseTypeKey], new List<string> { cachedPath });
                     }
 
                     // The cached file is valid so just rewrite the path.
@@ -502,24 +555,34 @@ namespace ImageProcessor.Web.HttpModules
         /// <summary>
         /// This will make the browser and server keep the output
         /// in its cache and thereby improve performance.
-        /// See http://en.wikipedia.org/wiki/HTTP_ETag
+        /// <see href="http://en.wikipedia.org/wiki/HTTP_ETag"/>
         /// </summary>
         /// <param name="context">
-        /// the <see cref="T:System.Web.HttpContext">HttpContext</see> object that provides 
-        /// references to the intrinsic server objects 
+        /// the <see cref="T:System.Web.HttpContext">HttpContext</see> object that provides
+        /// references to the intrinsic server objects
         /// </param>
-        /// <param name="responseType">The HTTP MIME type to to send.</param>
-        private void SetHeaders(HttpContext context, string responseType)
+        /// <param name="responseType">
+        /// The HTTP MIME type to send.
+        /// </param>
+        /// <param name="dependencyPaths">
+        /// The dependency path for the cache dependency.
+        /// </param>
+        private void SetHeaders(HttpContext context, string responseType, IEnumerable<string> dependencyPaths)
         {
             HttpResponse response = context.Response;
 
             response.ContentType = responseType;
 
-            response.AddHeader("Image-Served-By", "ImageProcessor.Web/" + AssemblyVersion);
+            if (response.Headers["Image-Served-By"] == null)
+            {
+                response.AddHeader("Image-Served-By", "ImageProcessor.Web/" + AssemblyVersion);
+            }
 
             HttpCachePolicy cache = response.Cache;
             cache.SetCacheability(HttpCacheability.Public);
             cache.VaryByHeaders["Accept-Encoding"] = true;
+
+            context.Response.AddFileDependencies(dependencyPaths.ToArray());
             cache.SetLastModifiedFromFileDependencies();
 
             int maxDays = DiskCache.MaxFileCachedDuration;

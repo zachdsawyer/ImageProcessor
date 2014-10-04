@@ -46,14 +46,15 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Caching\CachedImage.cs" />
-    <Compile Include="Caching\MemCache.cs" />
     <Compile Include="Caching\DiskCache.cs" />
+    <Compile Include="Caching\MemCache.cs" />
     <Compile Include="Caching\CacheIndexer.cs" />
     <Compile Include="Config\ImageCacheSection.cs" />
     <Compile Include="Config\ImageProcessingSection.cs" />
     <Compile Include="Config\ImageProcessorConfig.cs" />
     <Compile Include="Config\ImageSecuritySection.cs" />
     <Compile Include="Extensions\DirectoryInfoExtensions.cs" />
+    <Compile Include="Helpers\AsyncDuplicateLock.cs" />
     <Compile Include="Helpers\ResourceHelpers.cs" />
     <Compile Include="Helpers\ImageHelpers.cs" />
     <Compile Include="Helpers\RemoteFile.cs" />

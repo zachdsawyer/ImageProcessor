@@ -11,6 +11,8 @@
 namespace ImageProcessor.Web.Helpers
 {
     #region Using
+
+    using System.IO;
     using System.Text.RegularExpressions;
     #endregion
 
@@ -37,6 +39,28 @@ namespace ImageProcessor.Web.Helpers
         public static bool IsValidImageExtension(string fileName)
         {
             return EndFormatRegex.IsMatch(fileName);
+        }
+
+        /// <summary>
+        /// Get the correct mime-type for the given string input.
+        /// </summary>
+        /// <param name="path">
+        /// The path to the cached image.
+        /// </param>
+        /// <returns>
+        /// The <see cref="string"/> matching the correct mime-type.
+        /// </returns>
+        public static string GetMimeType(string path)
+        {
+            // This is the best we can do in this version as there are no header readers
+            string extension = Path.GetExtension(path);
+            if (extension != null)
+            {
+                extension = extension.TrimStart('.');
+                return "image/" + extension;
+            }
+
+            return string.Empty;
         }
 
         /// <summary>
